@@ -1417,6 +1417,43 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     return default
 
 
+def _project_channel_from_cwd(cwd: Any) -> str:
+    """``project:<repo>`` for a working directory inside a git repository, else ``""``.
+
+    The name is the *main* repository's folder, so every linked worktree of one
+    repository maps to the same project (kanban workers run in per-task
+    worktrees). A repository rooted at the home directory or the filesystem
+    root is not a project. Stdlib only; never raises.
+    """
+    if not cwd or not str(cwd).strip():
+        return ""  # Path("") would silently mean the process cwd
+    try:
+        start = Path(str(cwd)).expanduser().resolve()
+        home = Path.home().resolve()
+        for folder in (start, *start.parents):
+            if folder == home or folder == Path(folder.anchor):
+                return ""
+            marker = folder / ".git"
+            if marker.is_dir():
+                return "project:" + folder.name
+            if marker.is_file():
+                # Linked worktree / submodule: ``gitdir: <git-dir>``; for a worktree
+                # ``<git-dir>/commondir`` points at the main ``.git`` directory.
+                text = marker.read_text(errors="replace").strip()
+                if not text.startswith("gitdir:"):
+                    return "project:" + folder.name
+                gitdir = (folder / text[len("gitdir:"):].strip()).resolve()
+                common = gitdir / "commondir"
+                if common.is_file():
+                    main_git = (gitdir / common.read_text().strip()).resolve()
+                    if main_git.name == ".git":
+                        return "project:" + main_git.parent.name
+                return "project:" + folder.name
+    except Exception:
+        return ""
+    return ""
+
+
 def _parse_env_bool(key: str, default: bool) -> bool:
     """Read a boolean env var, falling back to default on missing/invalid values."""
     return _coerce_bool(os.environ.get(key), default)
@@ -2616,6 +2653,15 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             kwargs.get("agent_identity", None) or init_profile or ""
         )
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
+        # Opt-in project scoping (MNEMOSYNE_PROJECT_CHANNEL=1): a session whose cwd is inside
+        # a git repository joins the channel ``project:<repo>`` unless the host passed an
+        # explicit channel_id. Rows written there are recalled by every session of the same
+        # project (all worktrees), and by no other project.
+        self._project_channel = ""
+        if not kwargs.get("channel_id") and _parse_env_bool("MNEMOSYNE_PROJECT_CHANNEL", False):
+            self._project_channel = _project_channel_from_cwd(kwargs.get("cwd") or "")
+            if self._project_channel:
+                kwargs["channel_id"] = self._project_channel
         self._channel_id_explicit = bool(kwargs.get("channel_id"))
 
         # Apply provider-specific config from kwargs (Hermes-passed) or config.yaml fallback
@@ -2891,6 +2937,20 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
                 if snapshot is not None and not snapshot.generation.valid:
                     recall_kwargs.pop("exclude_captures", None)
                     results = beam.recall(**recall_kwargs)
+
+                if getattr(self, "_project_channel", ""):
+                    # Rows of the project channel recalled from any session, merged with the
+                    # usual session + global view (an explicit channel filter alone would drop
+                    # global facts).
+                    try:
+                        by_id = {r.get("id"): r for r in (results or [])}
+                        for extra in beam.recall(**{**recall_kwargs, "channel_id": self._project_channel}) or []:
+                            cur = by_id.get(extra.get("id"))
+                            if cur is None or (extra.get("score") or 0) > (cur.get("score") or 0):
+                                by_id[extra.get("id")] = extra
+                        results = sorted(by_id.values(), key=lambda r: r.get("score") or 0, reverse=True)
+                    except Exception as e:
+                        logger.debug("Mnemosyne project-channel prefetch failed: %s", e)
 
                 canonical_rows: List[Dict[str, Any]] = []
                 try:

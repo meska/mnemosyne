@@ -1454,6 +1454,20 @@ def _project_channel_from_cwd(cwd: Any) -> str:
     return ""
 
 
+def _kanban_board_channel() -> str:
+    """``board:<slug>`` inside a Hermes kanban worker, else ``""``.
+
+    Workers get ``HERMES_KANBAN_BOARD`` and ``HERMES_KANBAN_TASK`` in their environment; both
+    are required so a process that merely has a board selected (a gateway or a CLI) is not
+    mistaken for a worker. The board names the shared work context even when a task's
+    workspace is a scratch directory, not a git repository.
+    """
+    board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if board and os.environ.get("HERMES_KANBAN_TASK", "").strip():
+        return "board:" + board
+    return ""
+
+
 def _parse_env_bool(key: str, default: bool) -> bool:
     """Read a boolean env var, falling back to default on missing/invalid values."""
     return _coerce_bool(os.environ.get(key), default)
@@ -2653,13 +2667,13 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             kwargs.get("agent_identity", None) or init_profile or ""
         )
         self._gateway_session_key = kwargs.get("gateway_session_key") or ""
-        # Opt-in project scoping (MNEMOSYNE_PROJECT_CHANNEL=1): a session whose cwd is inside
-        # a git repository joins the channel ``project:<repo>`` unless the host passed an
+        # Opt-in project scoping (MNEMOSYNE_PROJECT_CHANNEL=1): a kanban worker joins ``board:<slug>``;
+        # any other session whose cwd is inside a git repository joins ``project:<repo>``, unless the host passed an
         # explicit channel_id. Rows written there are recalled by every session of the same
         # project (all worktrees), and by no other project.
         self._project_channel = ""
         if not kwargs.get("channel_id") and _parse_env_bool("MNEMOSYNE_PROJECT_CHANNEL", False):
-            self._project_channel = _project_channel_from_cwd(kwargs.get("cwd") or "")
+            self._project_channel = _kanban_board_channel() or _project_channel_from_cwd(kwargs.get("cwd") or "")
             if self._project_channel:
                 kwargs["channel_id"] = self._project_channel
         self._channel_id_explicit = bool(kwargs.get("channel_id"))

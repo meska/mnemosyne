@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from mnemosyne_hermes import MnemosyneMemoryProvider, _project_channel_from_cwd
+from mnemosyne_hermes import MnemosyneMemoryProvider, _kanban_board_channel, _project_channel_from_cwd
 
 
 def _git_repo(path: Path) -> Path:
@@ -92,3 +92,36 @@ def test_explicit_channel_id_wins(tmp_path, monkeypatch):
     p = MnemosyneMemoryProvider()
     p.initialize(session_id="s", hermes_home=str(tmp_path / "hh"), platform="cli", cwd=str(a), channel_id="team-x")
     assert p._project_channel == ""
+
+
+def test_kanban_board_channel_needs_board_and_task(monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert _kanban_board_channel() == ""
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "gnobbi")
+    assert _kanban_board_channel() == ""            # board selected but not a worker
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    assert _kanban_board_channel() == "board:gnobbi"
+
+
+def test_workers_of_one_board_share_memory_even_without_a_repository(tmp_path, monkeypatch):
+    scratch1 = tmp_path / "boards" / "gnobbi" / "workspaces" / "t_1"   # scratch dirs, not git repos
+    scratch2 = tmp_path / "boards" / "gnobbi" / "workspaces" / "t_2"
+    scratch1.mkdir(parents=True); scratch2.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "gnobbi")
+    s1 = _provider(tmp_path, "w-1", scratch1, monkeypatch)
+    assert s1._project_channel == "board:gnobbi"
+    s1._beam.remember(content="gnobbi renders avatars with the matrix sdk heroes fallback", source="conversation")
+    s2 = _provider(tmp_path, "w-2", scratch2, monkeypatch)
+    assert "matrix sdk heroes" in s2.prefetch("matrix sdk heroes avatars gnobbi", session_id="w-2")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "opspatrol")             # other board: isolated
+    s3 = _provider(tmp_path, "w-3", scratch2, monkeypatch)
+    assert "matrix sdk heroes" not in s3.prefetch("matrix sdk heroes avatars gnobbi", session_id="w-3")
+
+
+def test_board_wins_over_repository(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "gnobbi")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "gnobbi")
+    assert _provider(tmp_path, "w", repo, monkeypatch)._project_channel == "board:gnobbi"
